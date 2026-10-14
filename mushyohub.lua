@@ -1,4 +1,4 @@
--- MushYO Hub | Pesca, manutenção e previsão de sinuca | RetroBox UI 1.8.0
+-- MushYO Hub | Pesca, manutenção e previsão de sinuca | RetroBox API 2 (stable)
 local created
 
 local function installSnooker(window, Library, player, RS, proto, ups)
@@ -535,17 +535,17 @@ local function main()
         "Auto Fish precisa de getproto e getupvalues no executor.")
     assert(type(firesignal) == "function", "Auto Fish precisa de firesignal no executor.")
 
-    -- Raw fixado no commit da RetroBox 1.8.0.
-    local RAW = "https://raw.githubusercontent.com/ManoGustavo0/RetroBox/24e62185d74b1391d17e4d3c75e9d0fd6f9317d3/RetroBox-UI-v1.1.0/retrobox-ui/RetroBox.lua"
-    assert(type(loadstring) == "function", "RetroBox 1.8.0 requer loadstring no executor.")
+    -- Bootstrap permanente: recebe as próximas atualizações estáveis da API 2.
+    local LOADER_URL = "https://raw.githubusercontent.com/ManoGustavo0/RetroBox/main/dist/bootstrap/v2.lua"
+    assert(type(loadstring) == "function", "RetroBox API 2 requer loadstring no executor.")
     local loaded, Library = pcall(function()
-        local source = game:HttpGet(RAW)
-        local chunk, compileError = loadstring(source)
+        local source = game:HttpGet(LOADER_URL)
+        local chunk, compileError = loadstring(source, "@RetroBox-bootstrap-v2")
         assert(chunk, compileError)
-        return chunk()
+        return chunk({Channel = "stable"})
     end)
-    assert(loaded, "Falha ao carregar RetroBox 1.8.0 pelo raw: " .. tostring(Library))
-    assert(type(Library) == "table" and Library.Version == "1.8.0", "O raw precisa retornar a RetroBox UI 1.8.0.")
+    assert(loaded, "Falha ao carregar RetroBox API 2 pelo bootstrap: " .. tostring(Library))
+    assert(type(Library) == "table" and Library.APIVersion == 2 and type(Library.CreateWindow) == "function", "O bootstrap precisa retornar uma RetroBox compatível com a API 2.")
 
     local Players = game:GetService("Players")
     local RS = game:GetService("ReplicatedStorage")
@@ -990,7 +990,7 @@ local function main()
     hub.snooker = installSnooker(window, Library, player, RS, proto, upvalues)
     window:Notify({Title = "MushYO Hub", Icon = "target", Kind = "success", Duration = 6,
         Content = "Pronto. Pesca, Manutenção e Sinuca disponíveis. A previsão da sinuca está desligada até você ativar."})
-    print("[MushyoHub] pronto · RetroBox 1.8.0 · pesca, manutenção e sinuca")
+    print("[MushyoHub] pronto · RetroBox " .. Library.Version .. " · pesca, manutenção e sinuca")
 end
 
 task.defer(function()
