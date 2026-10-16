@@ -986,6 +986,478 @@ return function(hub, window, Library, player, RS, RF, events, ups)
 end
 
 end)()
+local makePoolPlanner=(function()
+-- Planejamento em cópias das bolas, com SnookerPhysics nativo e orçamento de tempo.
+return function(physics, config)
+    local P={}
+    local V=Vector3.new
+    local abs,min,max,sqrt=math.abs,math.min,math.max,math.sqrt
+    local function distanceSegment(point,a,b)
+        local d=b-a; local length=d:Dot(d)
+        if length<1e-10 then return (point-a).Magnitude end
+        local t=math.clamp((point-a):Dot(d)/length,0,1)
+        return (point-(a+d*t)).Magnitude
+    end
+    local function clear(s,a,b,skip1,skip2)
+        for _,ball in s.balls do
+            if not ball.Pocketed and ball.Id~=skip1 and ball.Id~=skip2 and
+                distanceSegment(ball.Pos,a,b)<s.frame.Diameter*.995 then return false end
+        end
+        return true
+    end
+    local function inside(s,p)
+        local f=s.frame; local r=f.Diameter*.5
+        return abs(p.X)<f.HalfLong-r and abs(p.Y)<f.HalfShort-r
+    end
+    local function allowed(s,id)
+        if id==0 then return false end
+        if s.cleared then return id==8 end
+        if id==8 then return false end
+        return s.group=="open" or (s.group=="solids" and id>=1 and id<=7) or (s.group=="stripes" and id>=9 and id<=15)
+    end
+    P.allowed=allowed
+    function P.snapshot(model,diameter,team)
+        local frame=physics.BuildFrame(model,diameter)
+        if not frame then return nil,"Geometria da mesa não carregada" end
+        local solids=model:GetAttribute("SolidsTeam")
+        if type(solids)=="number" and type(team)~="number" then return nil,"Aguardando identificação do seu grupo" end
+        local s={frame=frame,balls={},byId={},group=type(solids)~="number" and "open" or solids==team and "solids" or "stripes"}
+        local folder=model:FindFirstChild("Balls")
+        if not folder then return nil,"Bolas não carregadas" end
+        for _,b in folder:GetChildren() do
+            local id=b:GetAttribute("BallId")
+            local root=b:IsA("Model") and (b.PrimaryPart or b:FindFirstChildWhichIsA("BasePart"))
+            if type(id)=="number" and root then
+                local ball={Id=id,Pos=physics.WorldToLocal(frame,root.Position),Pocketed=b:GetAttribute("Pocketed")==true}
+                s.balls[#s.balls+1]=ball; s.byId[id]=ball
+            end
+        end
+        if #s.balls~=16 or not s.byId[0] or not s.byId[8] then return nil,"Aguardando as 16 bolas da mesa" end
+        table.sort(s.balls,function(a,b)return a.Id<b.Id end)
+        s.cleared=s.group~="open"
+        for _,b in s.balls do
+            if not b.Pocketed and b.Id~=0 and b.Id~=8 and allowed({group=s.group,cleared=false},b.Id) then s.cleared=false end
+        end
+        s.pockets=physics.NewState(frame).Pockets
+        return s
+    end
+    function P.key(s)
+        local t={s.group,tostring(s.cleared)}
+        for _,b in s.balls do
+            t[#t+1]=b.Pocketed and tostring(b.Id).."p" or string.format("%d:%.4f:%.4f",b.Id,b.Pos.X,b.Pos.Y)
+        end
+        return table.concat(t,";")
+    end
+    local function geometric(s,white,ball,pocket)
+        local delta=pocket-ball.Pos
+        if delta.Magnitude<.001 then return end
+        local outward=delta.Unit; local ghost=ball.Pos-outward*s.frame.Diameter
+        local aim=ghost-white
+        if aim.Magnitude<.001 or not inside(s,ghost) then return end
+        local cosine=aim.Unit:Dot(outward)
+        if cosine<.12 or not clear(s,white,ghost,0,ball.Id) or not clear(s,ball.Pos,pocket,0,ball.Id) then return end
+        local estimate=sqrt(2*config.GetDecel()*(aim.Magnitude+delta.Magnitude/(cosine*cosine*.90)))/config.GetMaxImpulse()+.025
+        local quality=cosine*cosine/(1+(aim.Magnitude+delta.Magnitude)/(s.frame.Diameter*24))
+        return {heading=aim.Unit,power=math.clamp(estimate,.07,1),target=ball.Id,
+            priority=500+quality*500,ghost=ghost,pocket=pocket,kind="Encaçapada direta",distance=aim.Magnitude}
+    end
+    local function candidates(s)
+        local white=s.byId[0].Pos; local all={}; local seen={}
+        local function add(c)
+            local h=c.heading
+            local key=string.format("%.4f:%.4f:%.3f",h.X,h.Y,c.power)
+            if not seen[key] then seen[key]=true; all[#all+1]=c end
+        end
+        local nearestFallback
+        for _,ball in s.balls do
+            if ball.Pocketed or not allowed(s,ball.Id) then continue end
+            local delta=ball.Pos-white
+            if delta.Magnitude<.001 then continue end
+            if clear(s,white,ball.Pos,0,ball.Id) then
+                local base=sqrt(2*config.GetDecel()*(delta.Magnitude+s.frame.HalfLong))/config.GetMaxImpulse()
+                for i,power in {math.clamp(base+.04,.12,.65),.48,.72,1} do
+                    local c={heading=delta.Unit,power=power,target=ball.Id,priority=100-i*3-delta.Magnitude,
+                        ghost=ball.Pos-delta.Unit*s.frame.Diameter,kind="Contato e defesa",distance=delta.Magnitude}
+                    add(c)
+                    if i==1 and (not nearestFallback or c.distance<nearestFallback.distance) then nearestFallback=c end
+                end
+            end
+            for _,pocket in s.pockets do
+                local c=geometric(s,white,ball,pocket)
+                if c then
+                    for i,factor in {1,.87,1.15} do
+                        local variant=table.clone(c); variant.power=math.clamp(c.power*factor,.05,1)
+                        variant.priority=c.priority-(i-1)*35; add(variant)
+                    end
+                end
+            end
+            -- Uma tabela da branca: alvo espelhado na linha real de colisão da borda.
+            local f=s.frame; local r=f.Diameter/2
+            for axis=1,2 do
+                for _,sign in {-1,1} do
+                    local bound=sign*(axis==1 and f.HalfLong-r or f.HalfShort-r)
+                    local mirror=axis==1 and V(2*bound-ball.Pos.X,ball.Pos.Y,0) or V(ball.Pos.X,2*bound-ball.Pos.Y,0)
+                    local d=mirror-white
+                    local component=axis==1 and d.X or d.Y
+                    if abs(component)<1e-5 then continue end
+                    local t=(bound-(axis==1 and white.X or white.Y))/component
+                    if t<=0 or t>=1 then continue end
+                    local rail=white+d*t
+                    if axis==1 and abs(rail.Y)>f.HalfShort-r*3 then continue end
+                    if axis==2 and (abs(rail.X)>f.HalfLong-r*3 or abs(rail.X)<r*3) then continue end
+                    if not clear(s,white,rail,0,nil) or not clear(s,rail,ball.Pos,0,ball.Id) then continue end
+                    local power=math.clamp(sqrt(2*config.GetDecel()*(d.Magnitude+f.HalfLong))/config.GetMaxImpulse()+.07,.15,.85)
+                    add({heading=d.Unit,power=power,target=ball.Id,priority=40-d.Magnitude,ghost=rail,kind="Defesa por tabela",distance=d.Magnitude})
+                end
+            end
+        end
+        table.sort(all,function(a,b)return a.priority>b.priority end)
+        -- Testa uma defesa antes das tentativas de encaçapar, reservando uma alternativa válida.
+        if nearestFallback then table.insert(all,1,table.clone(nearestFallback)) end
+        return all
+    end
+    local function ease(s,balls,white,own)
+        local copy={frame=s.frame,balls=balls}
+        local best=0
+        for _,b in balls do
+            if b.Id==0 or b.Pocketed or (allowed(s,b.Id)~=own) then continue end
+            if b.Id==8 and not s.cleared then continue end
+            for _,pocket in s.pockets do
+                local c=geometric(copy,white,b,pocket)
+                if c then best=max(best,(c.priority-500)/500) end
+            end
+        end
+        return best
+    end
+    local function evaluate(s,state,first,rail,potted,candidate)
+        if not first or not allowed(s,first) then return nil,"Primeiro contato fora do grupo" end
+        if state.ById[0].Pocketed then return nil,"Branca na caçapa" end
+        if potted[8] and not s.cleared then return nil,"Bola 8 antecipada" end
+        local own,enemy,solid,stripe=0,0,0,0
+        for id in potted do
+            if id>=1 and id<=7 then solid=solid+1 elseif id>=9 then stripe=stripe+1 end
+            if id~=0 and id~=8 then if allowed(s,id) then own=own+1 else enemy=enemy+1 end end
+        end
+        if s.group=="open" then own,enemy=max(solid,stripe),min(solid,stripe) end
+        if own==0 and not potted[8] and not rail then return nil,"Sem caçapa nem tabela após contato" end
+        local score=own*1200-enemy*1000-candidate.power*15
+        if potted[8] and s.cleared then score=score+100000 end
+        local white=state.ById[0].Pos
+        score=score+ease(s,state.Balls,white,true)*110
+        if own==0 then score=score-ease(s,state.Balls,white,false)*160 end
+        -- Afasta a branca das bocas e considera sua posição para a próxima tacada.
+        local closest=math.huge
+        for _,pocket in s.pockets do closest=min(closest,(white-pocket).Magnitude) end
+        score=score+min(closest/s.frame.Diameter,5)*3
+        local count=0; for _,b in s.balls do if not b.Pocketed and b.Id~=0 then count=count+1 end end
+        if s.group=="open" and count>=14 then
+            local spread=0
+            for _,b in state.Balls do if b.Id~=0 and not b.Pocketed then spread=spread+(b.Pos-V(s.frame.Diameter*8,0,0)).Magnitude end end
+            score=score+spread*1.5
+        end
+        return {score=score,first=first,ownPotted=own,enemyPotted=enemy,potted=potted,
+            scratch=false,blackEarly=false,win=potted[8] and s.cleared or false,rail=rail}
+    end
+    function P.simulate(s,candidate,poll)
+        local state=physics.NewState(s.frame)
+        for _,b in s.balls do local ball=physics.AddBall(state,b.Id,b.Pos); ball.Pocketed=b.Pocketed end
+        local worldHeading=s.frame.Long*candidate.heading.X+s.frame.Short*candidate.heading.Y
+        physics.ApplyStrike(state,candidate.power,worldHeading)
+        local first,rail=nil,false; local potted={}; local previous={}
+        local dt=config.GetFixedDt(); local maxSteps=math.ceil(config.GetMaxSimTime()/dt)
+        for step=1,maxSteps do
+            if poll and step%32==0 then poll() end
+            if physics.Settled(state) then
+                local result,reason=evaluate(s,state,first,rail,potted,candidate)
+                if result then result.duration=(step-1)*dt; result.state=state; result.heading=worldHeading; result.power=candidate.power
+                    result.target=candidate.target; result.kind=result.ownPotted>0 and candidate.kind or "Contato e defesa"; result.ghost=candidate.ghost end
+                return result,reason
+            end
+            local whiteBefore=state.ById[0].Pos
+            for _,b in state.Balls do previous[b.Id]=b.Vel end
+            local ev=physics.Step(state)
+            for _,id in ev.Pocketed do potted[id]=true end
+            if not first then
+                local nearest=math.huge
+                for _,b in state.Balls do
+                    if b.Id~=0 and not s.byId[b.Id].Pocketed and (b.Vel.Magnitude>.001 or potted[b.Id]) then
+                        local dist=(b.Pos-whiteBefore).Magnitude
+                        if dist<nearest then nearest=dist; first=b.Id end
+                    end
+                end
+            end
+            if first then
+                for _,b in state.Balls do
+                    if b.Pocketed then continue end
+                    local prev=previous[b.Id]
+                    local xNear=abs(b.Pos.X)>=s.frame.HalfLong-state.Radius-abs(prev.X)*dt*1.5-s.frame.Diameter*.1
+                    local yNear=abs(b.Pos.Y)>=s.frame.HalfShort-state.Radius-abs(prev.Y)*dt*1.5-s.frame.Diameter*.1
+                    if (xNear and prev.X*b.Vel.X<0) or (yNear and prev.Y*b.Vel.Y<0) then rail=true end
+                end
+            end
+        end
+        return nil,"Simulação não estabilizou"
+    end
+    function P.search(s,options)
+        options=options or {}; local start=os.clock(); local deadline=start+(options.seconds or 3)
+        local slice=start; local tested,safe=0,0
+        local function poll()
+            if options.context then options.context:ThrowIfCancelled() end
+            if options.cancelled and options.cancelled() then error("MUSH_POOL_STALE",0) end
+            if os.clock()>=deadline then error("MUSH_POOL_TIME",0) end
+            if os.clock()-slice>.004 then task.wait(); slice=os.clock() end
+        end
+        local list=candidates(s); local best
+        local maxTests=options.samples or 40
+        local baseLimit=min(#list,max(1,maxTests-4))
+        local limit=min(#list+4,maxTests)
+        local function try(candidate)
+            poll()
+            local result=P.simulate(s,candidate,poll); tested=tested+1
+            if result then
+                safe=safe+1
+                if not best or result.score>best.score then best=result end
+            end
+            if options.progress then options.progress(tested,limit,best) end
+        end
+        local ok,err=pcall(function()
+            for i=1,baseLimit do try(list[i]); if best and best.win then break end end
+            if best and not best.win then
+                local base=best
+                local angle=math.atan2(base.heading:Dot(s.frame.Short),base.heading:Dot(s.frame.Long))
+                local white=s.byId[0].Pos; local d=(base.ghost-white).Magnitude
+                local step=math.atan2(s.frame.Diameter*.12,max(d,s.frame.Diameter))
+                for _,offset in {-step,step} do
+                    for _,factor in {.94,1.06} do
+                        if tested>=maxTests then break end
+                        try({heading=V(math.cos(angle+offset),math.sin(angle+offset),0),power=math.clamp(base.power*factor,.04,1),
+                            target=base.target,kind="Mira refinada",ghost=base.ghost})
+                    end
+                end
+            end
+        end)
+        if not ok and not tostring(err):find("MUSH_POOL_TIME",1,true) then error(err,0) end
+        return best,{tested=tested,safe=safe,generated=#list,seconds=os.clock()-start,limited=not ok}
+    end
+    function P.place(s,maxLong)
+        local f=s.frame; local d=f.Diameter; local left=-f.HalfLong+d; local right=min(f.HalfLong-d,maxLong-d*.5)
+        if right<left then return nil end
+        local function usable(p)
+            if p.X<left or p.X>right or abs(p.Y)>f.HalfShort-d then return false end
+            for _,b in s.balls do if b.Id~=0 and not b.Pocketed and (b.Pos-p).Magnitude<d*1.1 then return false end end
+            for _,pocket in s.pockets do if (p-pocket).Magnitude<d*1.6 then return false end end
+            return true
+        end
+        local best,bestScore
+        for _,ball in s.balls do
+            if ball.Pocketed or not allowed(s,ball.Id) then continue end
+            for _,pocket in s.pockets do
+                local delta=pocket-ball.Pos
+                if delta.Magnitude<.001 then continue end
+                for _,multiplier in {3,5,8} do
+                    local pos=ball.Pos-delta.Unit*d*multiplier
+                    if usable(pos) then
+                        local c=geometric(s,pos,ball,pocket)
+                        if c and (not bestScore or c.priority>bestScore) then best,bestScore=pos,c.priority end
+                    end
+                end
+            end
+        end
+        if best then return physics.LocalToWorld(f,best) end
+        local x=math.clamp(config.GetWhite().Long*d,left,right)
+        for _,y in {0,f.HalfShort*.3,-f.HalfShort*.3,f.HalfShort*.6,-f.HalfShort*.6} do
+            local pos=V(x,y,0); if usable(pos) then return physics.LocalToWorld(f,pos) end
+        end
+        for ix=0,6 do for iy=-3,3 do
+            local pos=V(left+(right-left)*ix/6,iy*(f.HalfShort-d)/3,0)
+            if usable(pos) then return physics.LocalToWorld(f,pos) end
+        end end
+        return nil
+    end
+    return P
+end
+
+end)()
+local installPoolAuto=(function()
+return function(window, Library, player, RS, proto, ups, pool, Planner)
+    local client=require(RS.Client.Snooker)
+    local physics=require(RS.Modules.SnookerPhysics)
+    local config=require(RS.Configuration.Snooker)
+    local events=require(RS.Modules.Events)
+    local diameter=RS.Assets.Snooker.Ball:GetExtentsSize().X
+    local ai={alive=true,message="Auto play de sinuca desligado",submitted=0,confirmed=0,potted=0,placements=0,retries=0}
+    local watch=window:CreateScope()
+    local tab=pool.tab
+    local section=tab:CreateSection({Title="Auto play inteligente",Icon="crown"})
+    local toggle=section:AddToggle({Id="mush.snooker.auto",Title="Jogar sinuca automaticamente",Icon="crown",Default=false,
+        Tooltip="Na sua vez, simula direções e forças com SnookerPhysics. Busca encaçapadas e defesas; evita branca na caçapa, contato fora do grupo e bola 8 antecipada. Não garante vitória."})
+    section:AddToggle({Id="mush.snooker.auto-place",Title="Posicionar a branca automaticamente",Icon="target",Default=true,
+        Tooltip="Usa a confirmação nativa para posicionar a branca na saída e na bola na mão após faltas, respeitando limites e outras bolas."})
+    section:AddToggle({Id="mush.snooker.auto-preview",Title="Mostrar a trajetória escolhida pela IA",Icon="eye",Default=true,
+        Tooltip="Exibe a simulação da tacada escolhida e a mantém durante o movimento. Usa as opções de trajetórias e marcas desta aba."})
+    section:AddSlider({Id="mush.snooker.auto-time",Title="Tempo de análise por tacada",Icon="clock",Min=.5,Max=8,Step=.5,Default=3,Suffix=" s",
+        Tooltip="Orçamento máximo de busca. Também respeita o tempo restante da sua vez. Mais tempo permite comparar mais opções."})
+    section:AddSlider({Id="mush.snooker.auto-samples",Title="Limite de opções simuladas",Icon="sliders",Min=12,Max=80,Step=4,Default=36,
+        Tooltip="Compara tacadas diretas, forças diferentes, contatos defensivos e tabelas da branca. A busca para no limite de tempo."})
+    local label=section:AddLabel({Id="mush.snooker.auto-status",Title="Estado do auto play",Icon="notification",Default=ai.message})
+    local details=section:AddLabel({Id="mush.snooker.auto-analysis",Title="Última escolha",Icon="target",Default="Nenhuma tacada calculada"})
+    local shots=section:AddStatCard({Id="mush.snooker.auto-shots",Title="Tacadas confirmadas",Icon="success",Value=0})
+    local potted=section:AddStatCard({Id="mush.snooker.auto-potted",Title="Bolas-alvo encaçapadas",Icon="target",Value=0})
+    section:AddLabel({Id="mush.snooker.auto-help",Title="Funcionamento",Icon="info",
+        Default="Entre normalmente numa partida e ative o auto play. A IA espera sua vez e as bolas pararem.\n"
+            .."Avalia direções, forças, capturas e posição da branca para a próxima tacada; usa a execução nativa do jogo.\n"
+            .."A prévia manual pausa enquanto a IA está ligada. Ao desligar, uma tacada já enviada continua sendo resolvida pelo jogo."})
+
+    local function busy(model)
+        local context=pool:ReadContext()
+        return context and context.model==model and context.busy or false
+    end
+    local function watchModel(model)
+        if ai.model==model then return end
+        watch:Clean(); ai.model=model; ai.pending=nil; ai.failedKey=nil; ai.retries=0
+        watch:Add(model:GetAttributeChangedSignal("SnookerBusy"):Connect(function()
+            local pending=ai.pending
+            if pending and pending.model==model and model:GetAttribute("SnookerBusy")==true and not pending.ack then
+                pending.ack=true; ai.confirmed=ai.confirmed+1
+            end
+        end))
+        local balls=model:FindFirstChild("Balls")
+        if balls then for _,ball in balls:GetChildren() do
+            watch:Add(ball:GetAttributeChangedSignal("Pocketed"):Connect(function()
+                local pending=ai.pending; local id=ball:GetAttribute("BallId")
+                if pending and pending.model==model and id and not pending.before[id] and not pending.seen[id] and ball:GetAttribute("Pocketed")==true then
+                    pending.seen[id]=true
+                    if Planner.allowed(pending.snapshot,id) then ai.potted=ai.potted+1 end
+                end
+            end))
+        end end
+    end
+    local function placement(context,snapshot)
+        if ai.placementAt and os.clock()-ai.placementAt<1.5 then return false,"Aguardando confirmação da posição da branca" end
+        for _,fn in ipairs(proto(client.PlaceWhite,11,true)) do
+            local u=ups(fn)
+            local white=u[3]
+            if u[1]==false and u[2]==nil and typeof(white)=="Instance" and white.Parent==context.model:FindFirstChild("Balls")
+                and type(u[5])=="table" and type(u[6])=="function" then
+                local upper
+                for _,resolve in ipairs(proto(client.PlaceWhite,9,true)) do
+                    local r=ups(resolve)
+                    if r[1]==u[5] and type(r[2])=="number" then upper=r[2]; break end
+                end
+                if not upper then return false,"Aguardando os limites nativos de posicionamento" end
+                local pos=Planner.place(snapshot,upper)
+                if not pos or not u[6](pos) then return false,"Nenhuma posição livre para a branca" end
+                -- Finish desconecta a mira de posicionamento e chama a confirmação original.
+                white:PivotTo(CFrame.new(pos+Vector3.new(0,diameter,0)))
+                ai.placementAt=os.clock(); fn(); ai.placements=ai.placements+1
+                return true,"Confirmando a posição da branca"
+            end
+        end
+        return false,"Aguardando o posicionador nativo da branca"
+    end
+    local function validContext(c,model)
+        return c and c.model==model and model.Parent and not c.placing and not c.busy and not c.holding and not c.pending
+            and model:GetAttribute("ShooterId")==player.UserId
+    end
+    local job=window:CreateTask({Id="mush.snooker.auto-task",Interval=.2,Start=false,OnError="Stop",Callback=function(ctx)
+        ctx:ThrowIfCancelled()
+        local context=pool:ReadContext()
+        if not context or not player.PlayerGui:FindFirstChild("Snooker") then
+            ai.message="Entre numa partida de sinuca"; return
+        end
+        local model=context.model; watchModel(model)
+        local pending=ai.pending
+        if pending then
+            if context.busy then ai.message="Tacada em movimento; aguardando as bolas pararem"; return end
+            if pending.ack then ai.pending=nil; ai.message="Tacada resolvida; aguardando a vez"; return end
+            if os.clock()-pending.at>5 then error("O servidor não confirmou a tacada. Auto play pausado para evitar envios duplicados.") end
+            ai.message="Aguardando confirmação da tacada pelo servidor"; return
+        end
+        if model:GetAttribute("ShooterId")~=player.UserId then ai.message="Aguardando a vez do adversário"; return end
+        if context.busy then ai.message="Aguardando as bolas pararem"; return end
+        if context.holding or context.pending then ai.message="Aguardando terminar sua tacada manual"; return end
+        local snapshot,reason=Planner.snapshot(model,diameter,context.team)
+        if not snapshot then ai.message=reason; return end
+        if context.placing then
+            if not window:GetFlag("mush.snooker.auto-place") then ai.message="Posicione a branca para a IA começar"; return end
+            ctx:ThrowIfCancelled()
+            local _,message=placement(context,snapshot); ai.message=message; return
+        end
+        ai.placementAt=nil
+        if snapshot.byId[0].Pocketed then ai.message="Aguardando a branca voltar à mesa"; return end
+        local signature=Planner.key(snapshot)
+        if ai.failedKey==signature and ai.retries>=2 then ai.message="Não encontrei tacada sem falta prevista. Aumente o tempo de análise ou jogue esta vez manualmente."; return end
+        local seconds=window:GetFlag("mush.snooker.auto-time") or 3
+        local ends=model:GetAttribute("TurnEnds")
+        if type(ends)=="number" then seconds=math.min(seconds,ends-workspace:GetServerTimeNow()-.65) end
+        if seconds<.2 then ai.message="Tempo da vez terminando; aguardando atualização do jogo"; return end
+        ai.message="Comparando tacadas e forças..."; pool:Clear()
+        local function stale()
+            if not ai.alive then return true end
+            local c=pool:ReadContext()
+            if not validContext(c,model) then return true end
+            local s=Planner.snapshot(model,diameter,c.team)
+            return not s or Planner.key(s)~=signature
+        end
+        local ok,best,stats=pcall(Planner.search,snapshot,{context=ctx,seconds=seconds,samples=window:GetFlag("mush.snooker.auto-samples"),
+            cancelled=stale,progress=function(n,total,result)
+                ai.message=string.format("Analisando %d/%d opções%s",n,total,result and " • alternativa sem falta encontrada" or "")
+            end})
+        if not ok then
+            if ctx:IsCancelled() or stale() or tostring(best):find("MUSH_POOL_STALE",1,true) then return end
+            error(best)
+        end
+        ctx:ThrowIfCancelled()
+        if stale() then return end
+        ai.analysis={tested=stats.tested,safe=stats.safe,seconds=stats.seconds,power=best and best.power,target=best and best.target,
+            first=best and best.first,ownPotted=best and best.ownPotted,enemyPotted=best and best.enemyPotted,kind=best and best.kind,win=best and best.win}
+        if not best then
+            ai.retries=ai.failedKey==signature and ai.retries+1 or 1; ai.failedKey=signature
+            ai.message="Nenhuma opção sem falta prevista nesta busca; ampliando a comparação"
+            details:SetText(string.format("%d opções completas em %.2fs; nenhuma passou pelo filtro de segurança",stats.tested,stats.seconds))
+            return
+        end
+        ai.failedKey=nil; ai.retries=0
+        local pots={}; for id in best.potted do if id~=0 then pots[#pots+1]=id end end; table.sort(pots)
+        local names={}; for _,id in pots do names[#names+1]=tostring(id) end
+        details:SetText(string.format("%s • primeiro contato: bola %d • força %.1f%%\nCaçapas previstas: %s • %d opções em %.2fs%s",
+            best.kind,best.first,best.power*100,#names>0 and table.concat(names,", ") or "nenhuma",stats.tested,stats.seconds,
+            best.win and " • bola 8 no momento correto" or ""))
+        if window:GetFlag("mush.snooker.auto-preview") then pool:ShowAutoShot(ctx,best.power,best.heading) end
+        ctx:ThrowIfCancelled()
+        if stale() then return end
+        local live=pool:ReadContext()
+        local before={}; for _,b in snapshot.balls do if b.Pocketed then before[b.Id]=true end end
+        ai.pending={model=model,at=os.clock(),snapshot=snapshot,before=before,seen={}}
+        -- Callback original: Blink.Snooker.Strike + RunShot(..., Reporting=true).
+        -- O próprio jogo simula a tacada e envia seu resultado real.
+        local sent,sendError=pcall(live.shoot,best.power,best.heading)
+        if not sent then ai.pending=nil; error(sendError) end
+        ai.submitted=ai.submitted+1; ai.message="Tacada enviada pelo controlador nativo"
+    end})
+    ai.job=job; toggle:BindTask(job,{Initial="Control",OnStop="TurnOff"})
+    window:Manage(window:GetFlagState("mush.snooker.auto"):Subscribe(function(enabled)
+        ai.failedKey=nil; ai.retries=0
+        if not enabled then ai.message="Auto play de sinuca desligado"; pool:Clear() end
+    end),"Disconnect")
+    window:Manage(events:Bind("SnookerGameOver",function(model)
+        if ai.model==model then ai.pending=nil; ai.message="Partida de sinuca encerrada"; pool:Clear() end
+    end),"Disconnect")
+    window:CreateTask({Id="mush.snooker.auto-telemetry",Interval=.25,Start=true,OnError="Continue",Callback=function(ctx)
+        ctx:ThrowIfCancelled(); local s=job:GetStatus()
+        label:SetText(s.LastError and "Erro: "..tostring(s.LastError) or ai.message)
+        shots:SetValue(ai.confirmed); potted:SetValue(ai.potted)
+        shots:SetSubtitle(string.format("%d envios • confirmação por SnookerBusy do servidor",ai.submitted))
+    end})
+    function ai:GetSnapshot()
+        return {status=self.message,submitted=self.submitted,confirmed=self.confirmed,potted=self.potted,
+            placements=self.placements,pending=self.pending~=nil,analysis=self.analysis,job=job:GetStatus()}
+    end
+    window:OnDestroy(function()ai.alive=false end)
+    return ai
+end
+
+end)()
 local created
 
 local function installSnooker(window, Library, player, RS, proto, ups)
@@ -1005,6 +1477,7 @@ local function installSnooker(window, Library, player, RS, proto, ups)
     local timeState = window:CreateState(0)
     local collisionState = window:CreateState(0)
     local tab = window:CreateTab({Title = "Sinuca", Icon = "target", Columns = 1})
+    pool.tab = tab
     local section = tab:CreateSection({Title = "Previsão da tacada", Icon = "target"})
     local toggle = section:AddToggle({Id = "mush.snooker.enabled", Title = "Mostrar previsão de sinuca",
         Icon = "eye", Default = false,
@@ -1270,6 +1743,7 @@ local function installSnooker(window, Library, player, RS, proto, ups)
     local job = window:CreateTask({Id = "mush.snooker.preview", Interval = 1 / 6, Start = false, OnError = "Continue",
         Callback = function(ctx)
             ctx:ThrowIfCancelled()
+            if window:GetFlag("mush.snooker.auto") then return end
             local aim, reason = snapshotNative()
             if not aim then pool:Clear(); pool.message = reason; status:SetText(reason); return end
             if aim.busy then
@@ -1313,10 +1787,39 @@ local function installSnooker(window, Library, player, RS, proto, ups)
     scope:Add(window:OnError(function(entry)
         if entry.ControlId == "mush.snooker.preview" then pool:Clear(); status:SetText("Sinuca: " .. tostring(entry.Message)) end
     end), "Disconnect")
+    function pool:ReadContext()
+        if not self.callback then snapshotNative() end
+        local fn = self.callback
+        if not fn then return nil end
+        local u = ups(fn)
+        if typeof(u[3]) ~= "Instance" or not u[3].Parent or typeof(u[28]) ~= "Instance" or not u[28].Parent then
+            self.callback = nil; self.scanAt = 0; return nil
+        end
+        if type(u[13]) ~= "function" or ups(u[13])[2] ~= u[3] then return nil end
+        local team = ups(client.Cue)[7]
+        if type(team) ~= "number" then
+            if u[3]:GetAttribute("Team1Id") == player.UserId then team = 1
+            elseif u[3]:GetAttribute("Team2Id") == player.UserId then team = 2 end
+        end
+        return {model=u[3], placing=u[1].Placing==true, busy=u[2][u[3]]~=nil or u[3]:GetAttribute("SnookerBusy")==true,
+            holding=u[8]==true, pending=u[12]~=nil, shoot=u[13], team=team}
+    end
+    function pool:ShowAutoShot(ctx, power, heading)
+        local context = self:ReadContext()
+        if not context then return end
+        local result = predict(ctx, {model=context.model, power=power, heading=heading, held=true})
+        ctx:ThrowIfCancelled()
+        result.lockedShot = true
+        self.result = result
+        draw(result)
+        self.message = "Trajetória escolhida pela IA"
+        status:SetText(self.message)
+    end
     function pool:GetSnapshot()
         local r = self.result
         return {enabled = job:GetStatus().Requested, status = self.message, power = r and r.power,
-            firstBall = r and r.first, seconds = r and r.time, moved = r and r.moved, collisions = r and r.collisions}
+            firstBall = r and r.first, seconds = r and r.time, moved = r and r.moved, collisions = r and r.collisions,
+            auto = self.auto and self.auto:GetSnapshot()}
     end
     return pool
 end
@@ -1853,7 +2356,7 @@ local function main()
         window:SetFlags({["mush.auto.enabled"] = false, ["mush.sell.enabled"] = false,
             ["mush.repair.enabled"] = false, ["mush.snooker.enabled"] = false,
             ["mush.chess.preview"] = false, ["mush.chess.auto"] = false,
-            ["mush.mine.enabled"] = false})
+            ["mush.mine.enabled"] = false, ["mush.snooker.auto"] = false})
     end
     function hub:GetSnapshot()
         local status = job:GetStatus()
@@ -1990,10 +2493,12 @@ local function main()
         repairCard:SetSubtitle(string.format("Gasto observado: %.1f prata · saldo: %.1f", maintenance.spent, data.silver))
     end})
     hub.snooker = installSnooker(window, Library, player, RS, proto, upvalues)
+    local poolPlanner = makePoolPlanner(require(RS.Modules.SnookerPhysics), require(RS.Configuration.Snooker))
+    hub.snooker.auto = installPoolAuto(window, Library, player, RS, proto, upvalues, hub.snooker, poolPlanner)
     hub.chess = installChess(window, Library, player, RS, ChessEngine)
     hub.mining = installMining(hub, window, Library, player, RS, RF, events, upvalues)
     window:Notify({Title = "MushYO Hub", Icon = "target", Kind = "success", Duration = 6,
-        Content = "Pronto. Pesca, Mineração, Manutenção, Sinuca e Xadrez disponíveis. Configure a picareta e as vendas na aba Mineração."})
+        Content = "Pronto. Pesca, Mineração, Sinuca e Xadrez disponíveis. Auto play inteligente na aba Sinuca."})
     print("[MushyoHub] pronto · RetroBox API 2 · pesca, mineração, manutenção, sinuca e xadrez")
 end
 
